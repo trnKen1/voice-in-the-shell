@@ -3,9 +3,17 @@ websockets>=13.0
 python-dotenv>=1.0
 
 # Phase 1 — active listening
+# NOTE: this installs CPU-only torch by default. For GPU inference, after
+# this install run (see README "Setup" for the current CUDA tag):
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
 torch>=2.6
 silero-vad>=5.1
 resemblyzer>=0.1.4
 faster-whisper>=1.0
 sounddevice>=0.5
 numpy>=1.26
+
+# faster-whisper's backend (ctranslate2) needs these for GPU inference —
+# separate from torch's own CUDA runtime. Harmless if staying on CPU.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12

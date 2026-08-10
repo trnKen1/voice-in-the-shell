@@ -9,7 +9,7 @@ of auto-approving or auto-denying them.
 Wire protocol (JSON over WebSocket, one connection per shell instance):
 
 Shell -> backend:
-    {"type": "transcript", "text": "..."}
+    {"type": "transcript", "text": "..."}  # manual test path (no STT yet in the shell)
     {"type": "permission_response", "request_id": "...", "allow": bool, "message": "..."}
 
 Backend -> shell:
@@ -19,6 +19,11 @@ Backend -> shell:
     {"type": "turn_done"}
     {"type": "permission_request", "request_id": "...", "tool": "...", "input": {...}}
     {"type": "error", "message": "..."}
+
+Phase 1: transcripts also arrive from the local active-listening pipeline
+(mic -> VAD -> speaker filter -> STT, see audio_pipeline.py) — those are
+pushed into the same transcript queue as the shell's manual test messages,
+so run_turns doesn't care which source produced them.
 """
 
 import asyncio
@@ -30,6 +35,7 @@ import uuid
 from dotenv import load_dotenv
 import websockets
 
+from audio_pipeline import ActiveListeningPipeline
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -55,10 +61,15 @@ DEFAULT_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
 PERMISSION_TIMEOUT_SECONDS = 120
 
 
-async def handle_connection(websocket) -> None:
+async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> None:
     log.info("shell connected")
     pending_permissions: dict[str, asyncio.Future] = {}
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def run_active_listening() -> None:
+        async for text in pipeline.listen():
+            log.info("active listening transcript: %s", text)
+            await transcript_queue.put(text)
 
     async def can_use_tool(tool_name, input_data, context):
         request_id = str(uuid.uuid4())
@@ -111,8 +122,10 @@ async def handle_connection(websocket) -> None:
                 await websocket.send(json.dumps({"type": "speaking_end"}))
                 await websocket.send(json.dumps({"type": "turn_done"}))
 
+    pipeline.start()
     async with ClaudeSDKClient(options=options) as client:
         turn_task = asyncio.create_task(run_turns(client))
+        listening_task = asyncio.create_task(run_active_listening())
         try:
             async for raw in websocket:
                 msg = json.loads(raw)
@@ -127,13 +140,23 @@ async def handle_connection(websocket) -> None:
                     log.warning("unknown message type: %s", msg_type)
         finally:
             turn_task.cancel()
+            listening_task.cancel()
+            pipeline.stop()
             log.info("shell disconnected")
 
 
 async def main() -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY is not set — agent turns will fail until it is")
-    async with websockets.serve(handle_connection, HOST, PORT):
+
+    log.info("loading active-listening pipeline (VAD + speaker filter + STT)...")
+    pipeline = ActiveListeningPipeline()
+    log.info("active-listening pipeline ready")
+
+    async def handler(websocket):
+        await handle_connection(websocket, pipeline)
+
+    async with websockets.serve(handler, HOST, PORT):
         log.info("listening on ws://%s:%s", HOST, PORT)
         await asyncio.Future()  # run forever
 

@@ -6,6 +6,7 @@ dist-ssr
 .venv/
 __pycache__/
 *.pyc
+voice_profile.npy
 
 # OS
 .DS_Store

@@ -35,21 +35,24 @@ async function startMicVisualizer() {
   }
 }
 
-// No TTS yet (Phase 4) — mock output amplitude + canned subtitles so the
-// output bar and subtitle behavior can be built/demoed independently.
+let speaking = false;
+
+function outputTick() {
+  setBars(outputBars, speaking ? 0.3 + Math.random() * 0.7 : 0);
+  requestAnimationFrame(outputTick);
+}
+
+// Mock output — canned subtitles + fake amplitude. Used until Phase 2's
+// backend is reachable (or if it drops), so the output bar/subtitle can
+// still be seen working standalone.
 const mockLines = [
   "on it — checking your calendar",
   "sending that now",
   "want me to go ahead?",
   "done — anything else?",
 ];
-let speaking = false;
 let lineIndex = 0;
-
-function mockOutputTick() {
-  setBars(outputBars, speaking ? 0.3 + Math.random() * 0.7 : 0);
-  requestAnimationFrame(mockOutputTick);
-}
+let mockIntervalId = null;
 
 function speakMock() {
   speaking = true;
@@ -61,6 +64,97 @@ function speakMock() {
   }, 2200);
 }
 
+function startMock() {
+  if (mockIntervalId === null) {
+    mockIntervalId = setInterval(speakMock, 4000);
+  }
+}
+
+function stopMock() {
+  if (mockIntervalId !== null) {
+    clearInterval(mockIntervalId);
+    mockIntervalId = null;
+  }
+}
+
+// Phase 2 backend — persistent Claude Agent SDK session over a local
+// WebSocket (see backend/server.py for the wire protocol). Falls back to
+// the mock behavior above whenever it isn't reachable.
+const BACKEND_URL = "ws://127.0.0.1:8765";
+let ws = null;
+let pendingPermission = null; // { requestId, tool }
+
+function connectBackend() {
+  ws = new WebSocket(BACKEND_URL);
+
+  ws.onopen = () => {
+    stopMock();
+    subtitleEl.textContent = "listening…";
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    switch (msg.type) {
+      case "speaking_start":
+        speaking = true;
+        break;
+      case "assistant_text":
+        subtitleEl.textContent = msg.text;
+        break;
+      case "speaking_end":
+        speaking = false;
+        break;
+      case "turn_done":
+        if (!pendingPermission) subtitleEl.textContent = "listening…";
+        break;
+      case "permission_request":
+        pendingPermission = { requestId: msg.request_id, tool: msg.tool };
+        subtitleEl.textContent = `confirm: run ${msg.tool}? (y/n)`;
+        break;
+      case "error":
+        subtitleEl.textContent = `error: ${msg.message}`;
+        break;
+    }
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    startMock();
+  };
+
+  ws.onerror = () => {
+    // onclose fires right after — let that handle the fallback.
+  };
+}
+
+function respondToPermission(allow) {
+  if (!pendingPermission || !ws) return;
+  ws.send(
+    JSON.stringify({
+      type: "permission_response",
+      request_id: pendingPermission.requestId,
+      allow,
+    }),
+  );
+  pendingPermission = null;
+  subtitleEl.textContent = "listening…";
+}
+
+// No STT yet (Phase 1) — "T" sends a typed test transcript to the backend
+// so the Phase 2 wiring is testable end-to-end before real speech input
+// exists. Remove once Phase 1 feeds real transcripts here instead.
+window.addEventListener("keydown", (e) => {
+  if (pendingPermission && (e.key === "y" || e.key === "Y")) {
+    respondToPermission(true);
+  } else if (pendingPermission && (e.key === "n" || e.key === "N")) {
+    respondToPermission(false);
+  } else if (!pendingPermission && (e.key === "t" || e.key === "T") && ws) {
+    const text = window.prompt("Test transcript to send to the backend:");
+    if (text) ws.send(JSON.stringify({ type: "transcript", text }));
+  }
+});
+
 startMicVisualizer();
-mockOutputTick();
-setInterval(speakMock, 4000);
+outputTick();
+startMock();
+connectBackend();

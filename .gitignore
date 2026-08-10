@@ -3,6 +3,9 @@ node_modules
 dist
 dist-ssr
 *.local
+.venv/
+__pycache__/
+*.pyc
 
 # OS
 .DS_Store

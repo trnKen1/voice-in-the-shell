@@ -109,7 +109,17 @@ function connectBackend() {
         break;
       case "permission_request":
         pendingPermission = { requestId: msg.request_id, tool: msg.tool };
-        subtitleEl.textContent = `confirm: run ${msg.tool}? (y/n)`;
+        document.body.classList.add("confirm-pending");
+        subtitleEl.textContent = `confirm: run ${msg.tool}? say "yes"/"no" or press y/n`;
+        break;
+      case "permission_resolved":
+        // Backend resolved it (voice, typed text, or the y/n keys below) —
+        // clear local state so this doesn't fight a stale keypress.
+        if (pendingPermission && pendingPermission.requestId === msg.request_id) {
+          pendingPermission = null;
+          document.body.classList.remove("confirm-pending");
+          subtitleEl.textContent = "listening…";
+        }
         break;
       case "error":
         subtitleEl.textContent = `error: ${msg.message}`;
@@ -129,6 +139,9 @@ function connectBackend() {
 
 function respondToPermission(allow) {
   if (!pendingPermission || !ws) return;
+  // Don't clear local state here — wait for the backend's
+  // permission_resolved reply, so voice/typed/keyboard resolution paths
+  // can't race each other into inconsistent UI state.
   ws.send(
     JSON.stringify({
       type: "permission_response",
@@ -136,13 +149,12 @@ function respondToPermission(allow) {
       allow,
     }),
   );
-  pendingPermission = null;
-  subtitleEl.textContent = "listening…";
 }
 
-// No STT yet (Phase 1) — "T" sends a typed test transcript to the backend
-// so the Phase 2 wiring is testable end-to-end before real speech input
-// exists. Remove once Phase 1 feeds real transcripts here instead.
+// "T" sends a typed test transcript to the backend — handy for testing
+// without speaking (kept intentionally, not just a Phase 1 stopgap).
+// While a permission is pending, y/n are the fast local path; the backend
+// would also accept a spoken/typed "yes"/"no" as an answer either way.
 window.addEventListener("keydown", (e) => {
   if (pendingPermission && (e.key === "y" || e.key === "Y")) {
     respondToPermission(true);

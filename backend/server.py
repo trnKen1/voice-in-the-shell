@@ -18,12 +18,18 @@ Backend -> shell:
     {"type": "speaking_end"}
     {"type": "turn_done"}
     {"type": "permission_request", "request_id": "...", "tool": "...", "input": {...}}
+    {"type": "permission_resolved", "request_id": "..."}
     {"type": "error", "message": "..."}
 
 Phase 1: transcripts also arrive from the local active-listening pipeline
-(mic -> VAD -> speaker filter -> STT, see audio_pipeline.py) — those are
-pushed into the same transcript queue as the shell's manual test messages,
-so run_turns doesn't care which source produced them.
+(mic -> VAD -> speaker filter -> STT, see audio_pipeline.py).
+
+Phase 3: incoming text (from either source) is routed through
+resolve_or_queue() — if a permission confirmation is pending, it's checked
+for a yes/no answer (voice_commands.interpret_yes_no) and consumed as the
+answer instead of becoming a new agent turn. Access-level scoping (which
+tools are auto-approved) is loaded from access_config.json, not hardcoded,
+so it can be edited without touching code.
 """
 
 import asyncio
@@ -44,6 +50,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ResultMessage,
 )
+from voice_commands import interpret_yes_no
 
 load_dotenv()
 
@@ -55,26 +62,69 @@ PORT = 8765
 
 # Conservative default: read-only tools auto-approved. Everything else
 # (Write, Edit, Bash, ...) falls through to can_use_tool and gets a
-# confirmation round-trip through the shell before it runs.
+# confirmation round-trip through the shell before it runs. Overridden by
+# access_config.json when present — see load_allowed_tools().
 DEFAULT_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
+ACCESS_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "access_config.json")
 
 PERMISSION_TIMEOUT_SECONDS = 120
+
+
+def load_allowed_tools() -> list[str]:
+    if os.path.exists(ACCESS_CONFIG_PATH):
+        try:
+            with open(ACCESS_CONFIG_PATH, encoding="utf-8") as f:
+                config = json.load(f)
+            tools = config.get("allowed_tools")
+            if isinstance(tools, list):
+                return tools
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("failed to read %s (%s), using defaults", ACCESS_CONFIG_PATH, exc)
+    return DEFAULT_ALLOWED_TOOLS
 
 
 async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> None:
     log.info("shell connected")
     pending_permissions: dict[str, asyncio.Future] = {}
+    pending_confirmation_request_id: str | None = None
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def resolve_permission(request_id: str, allow: bool, message: str | None = None) -> bool:
+        """Resolves a pending can_use_tool future and notifies the shell.
+        Returns False if there was nothing pending under that id."""
+        nonlocal pending_confirmation_request_id
+        future = pending_permissions.pop(request_id, None)
+        if not future or future.done():
+            return False
+        future.set_result((allow, message))
+        if pending_confirmation_request_id == request_id:
+            pending_confirmation_request_id = None
+        await websocket.send(json.dumps({"type": "permission_resolved", "request_id": request_id}))
+        return True
+
+    async def resolve_or_queue(text: str) -> None:
+        """Incoming text (voice or typed) either answers a pending
+        confirmation or becomes a new agent turn — never both."""
+        if pending_confirmation_request_id is not None:
+            decision = interpret_yes_no(text)
+            if decision is not None:
+                await resolve_permission(pending_confirmation_request_id, decision)
+            else:
+                log.info("heard %r while awaiting confirmation — no clear yes/no, ignoring", text)
+            return
+        await transcript_queue.put(text)
 
     async def run_active_listening() -> None:
         async for text in pipeline.listen():
             log.info("active listening transcript: %s", text)
-            await transcript_queue.put(text)
+            await resolve_or_queue(text)
 
     async def can_use_tool(tool_name, input_data, context):
+        nonlocal pending_confirmation_request_id
         request_id = str(uuid.uuid4())
         future = asyncio.get_event_loop().create_future()
         pending_permissions[request_id] = future
+        pending_confirmation_request_id = request_id
         await websocket.send(json.dumps({
             "type": "permission_request",
             "request_id": request_id,
@@ -85,13 +135,16 @@ async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> Non
             allow, message = await asyncio.wait_for(future, timeout=PERMISSION_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             pending_permissions.pop(request_id, None)
+            if pending_confirmation_request_id == request_id:
+                pending_confirmation_request_id = None
+            await websocket.send(json.dumps({"type": "permission_resolved", "request_id": request_id}))
             return PermissionResultDeny(message="No response from shell — denied by timeout")
         if allow:
             return PermissionResultAllow(updated_input=input_data)
         return PermissionResultDeny(message=message or "Denied by user")
 
     options = ClaudeAgentOptions(
-        allowed_tools=DEFAULT_ALLOWED_TOOLS,
+        allowed_tools=load_allowed_tools(),
         permission_mode="default",
         can_use_tool=can_use_tool,
     )
@@ -131,11 +184,11 @@ async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> Non
                 msg = json.loads(raw)
                 msg_type = msg.get("type")
                 if msg_type == "transcript":
-                    await transcript_queue.put(msg["text"])
+                    await resolve_or_queue(msg["text"])
                 elif msg_type == "permission_response":
-                    future = pending_permissions.pop(msg.get("request_id"), None)
-                    if future and not future.done():
-                        future.set_result((msg.get("allow", False), msg.get("message")))
+                    await resolve_permission(
+                        msg.get("request_id"), msg.get("allow", False), msg.get("message")
+                    )
                 else:
                     log.warning("unknown message type: %s", msg_type)
         finally:

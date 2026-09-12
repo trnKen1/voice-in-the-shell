@@ -17,3 +17,7 @@ numpy>=1.26
 # separate from torch's own CUDA runtime. Harmless if staying on CPU.
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
+
+# Phase 4 — TTS. Piper is fast enough on CPU that GPU isn't needed here.
+# Requires a downloaded voice model — see download_voice.py.
+piper-tts>=1.6

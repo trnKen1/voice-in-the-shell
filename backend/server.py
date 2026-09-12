@@ -6,20 +6,28 @@ output, currently: whatever the shell forwards); this service streams back
 assistant text and routes tool-permission checks through the shell instead
 of auto-approving or auto-denying them.
 
-Wire protocol (JSON over WebSocket, one connection per shell instance):
+Wire protocol over WebSocket, one connection per shell instance. Most
+messages are JSON text frames; audio is sent as raw binary frames alongside
+a JSON header pair so the shell knows how to decode/play them.
 
-Shell -> backend:
+Shell -> backend (JSON):
     {"type": "transcript", "text": "..."}  # manual test path (no STT yet in the shell)
     {"type": "permission_response", "request_id": "...", "allow": bool, "message": "..."}
 
-Backend -> shell:
+Backend -> shell (JSON):
     {"type": "speaking_start"}
     {"type": "assistant_text", "text": "..."}
+    {"type": "audio_start", "sample_rate": int, "sample_width": 2, "channels": 1}
+    {"type": "audio_end"}
     {"type": "speaking_end"}
     {"type": "turn_done"}
     {"type": "permission_request", "request_id": "...", "tool": "...", "input": {...}}
     {"type": "permission_resolved", "request_id": "..."}
     {"type": "error", "message": "..."}
+
+Backend -> shell (binary): one or more raw 16-bit PCM chunks, sent between
+an audio_start/audio_end pair — the synthesized audio for the assistant_text
+that immediately preceded them.
 
 Phase 1: transcripts also arrive from the local active-listening pipeline
 (mic -> VAD -> speaker filter -> STT, see audio_pipeline.py).
@@ -30,6 +38,21 @@ for a yes/no answer (voice_commands.interpret_yes_no) and consumed as the
 answer instead of becoming a new agent turn. Access-level scoping (which
 tools are auto-approved) is loaded from access_config.json, not hardcoded,
 so it can be edited without touching code.
+
+Phase 4: each assistant_text block is synthesized to speech (tts.py, Piper)
+and streamed right after it as an audio_start/binary/audio_end sequence. A
+single background worker does this, one block at a time in order, so audio
+playback order always matches text order even though synthesis happens
+after the text (and therefore the subtitle) is already on screen. If no
+voice model is installed, tts.py's synthesize_pcm() returns None and no
+audio messages are sent at all — text-only turns keep working as before.
+
+Auth: ClaudeSDKClient shells out to a bundled Claude Code CLI, which
+resolves credentials the same way the CLI itself does — an explicit
+ANTHROPIC_API_KEY (metered billing) if set, otherwise the machine's
+existing Claude Code/claude.ai subscription login
+(~/.claude/.credentials.json), with no code-level branching needed here.
+See describe_auth() below for the startup log line.
 """
 
 import asyncio
@@ -37,6 +60,7 @@ import json
 import logging
 import os
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 import websockets
@@ -50,6 +74,7 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ResultMessage,
 )
+from tts import SpeechSynthesizer
 from voice_commands import interpret_yes_no
 
 load_dotenv()
@@ -68,6 +93,24 @@ DEFAULT_ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
 ACCESS_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "access_config.json")
 
 PERMISSION_TIMEOUT_SECONDS = 120
+CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+
+
+def describe_auth() -> str:
+    """Logged once at startup — which credential source the bundled Claude
+    Code CLI will use. Mirrors the CLI's own precedence: an explicit
+    ANTHROPIC_API_KEY always wins (metered billing) even if a subscription
+    login is also present; otherwise it falls back to the machine's
+    existing Claude Code/claude.ai login, if any."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "using ANTHROPIC_API_KEY (metered billing)"
+    if CLAUDE_CREDENTIALS_PATH.exists():
+        return f"using Claude Code subscription login ({CLAUDE_CREDENTIALS_PATH})"
+    return (
+        "no ANTHROPIC_API_KEY and no Claude Code login found — agent turns "
+        "will fail until one is set up (run `claude` to log in, or set "
+        "ANTHROPIC_API_KEY in .env)"
+    )
 
 
 def load_allowed_tools() -> list[str]:
@@ -83,11 +126,14 @@ def load_allowed_tools() -> list[str]:
     return DEFAULT_ALLOWED_TOOLS
 
 
-async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> None:
+async def handle_connection(
+    websocket, pipeline: ActiveListeningPipeline, synthesizer: SpeechSynthesizer
+) -> None:
     log.info("shell connected")
     pending_permissions: dict[str, asyncio.Future] = {}
     pending_confirmation_request_id: str | None = None
     transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+    tts_queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def resolve_permission(request_id: str, allow: bool, message: str | None = None) -> bool:
         """Resolves a pending can_use_tool future and notifies the shell.
@@ -118,6 +164,25 @@ async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> Non
         async for text in pipeline.listen():
             log.info("active listening transcript: %s", text)
             await resolve_or_queue(text)
+
+    async def run_tts() -> None:
+        """Synthesizes and streams one queued text block at a time, in
+        order — keeps audio playback order matching text order even though
+        synthesis (and therefore each block's audio) always lags a bit
+        behind its already-displayed subtitle."""
+        while True:
+            text = await tts_queue.get()
+            pcm = await asyncio.to_thread(synthesizer.synthesize_pcm, text)
+            if not pcm:
+                continue
+            await websocket.send(json.dumps({
+                "type": "audio_start",
+                "sample_rate": synthesizer.sample_rate,
+                "sample_width": 2,
+                "channels": 1,
+            }))
+            await websocket.send(pcm)
+            await websocket.send(json.dumps({"type": "audio_end"}))
 
     async def can_use_tool(tool_name, input_data, context):
         nonlocal pending_confirmation_request_id
@@ -163,6 +228,8 @@ async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> Non
                                     "type": "assistant_text",
                                     "text": block.text,
                                 }))
+                                if synthesizer.available:
+                                    await tts_queue.put(block.text)
                     elif isinstance(message, ResultMessage) and message.subtype != "success":
                         await websocket.send(json.dumps({
                             "type": "error",
@@ -179,6 +246,7 @@ async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> Non
     async with ClaudeSDKClient(options=options) as client:
         turn_task = asyncio.create_task(run_turns(client))
         listening_task = asyncio.create_task(run_active_listening())
+        tts_task = asyncio.create_task(run_tts())
         try:
             async for raw in websocket:
                 msg = json.loads(raw)
@@ -194,20 +262,25 @@ async def handle_connection(websocket, pipeline: ActiveListeningPipeline) -> Non
         finally:
             turn_task.cancel()
             listening_task.cancel()
+            tts_task.cancel()
             pipeline.stop()
             log.info("shell disconnected")
 
 
 async def main() -> None:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        log.warning("ANTHROPIC_API_KEY is not set — agent turns will fail until it is")
+    log.info("Claude auth: %s", describe_auth())
 
     log.info("loading active-listening pipeline (VAD + speaker filter + STT)...")
     pipeline = ActiveListeningPipeline()
     log.info("active-listening pipeline ready")
 
+    log.info("loading TTS voice...")
+    synthesizer = SpeechSynthesizer()
+    if not synthesizer.available:
+        log.warning("TTS running text-only — no voice model installed (see download_voice.py)")
+
     async def handler(websocket):
-        await handle_connection(websocket, pipeline)
+        await handle_connection(websocket, pipeline, synthesizer)
 
     async with websockets.serve(handler, HOST, PORT):
         log.info("listening on ws://%s:%s", HOST, PORT)

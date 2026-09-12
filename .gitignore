@@ -7,6 +7,7 @@ dist-ssr
 __pycache__/
 *.pyc
 voice_profile.npy
+backend/models/
 
 # OS
 .DS_Store

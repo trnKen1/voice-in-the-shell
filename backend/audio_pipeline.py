@@ -65,6 +65,8 @@ class ActiveListeningPipeline:
         self._encoder = VoiceEncoder()  # auto-selects CUDA if available, else CPU
         self._profile = self._load_profile()
         self._whisper = self._load_whisper()
+        self._audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+        self._stream: sd.InputStream | None = None
 
     def _load_whisper(self) -> WhisperModel:
         try:
@@ -83,8 +85,6 @@ class ActiveListeningPipeline:
                 exc,
             )
             return WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-        self._audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
-        self._stream: sd.InputStream | None = None
 
     def _load_profile(self) -> np.ndarray | None:
         if os.path.exists(PROFILE_PATH):

@@ -107,9 +107,32 @@ function handleAudioEnd() {
   source.start(startAt);
   nextPlaybackTime = startAt + audioBuffer.duration;
   audioSourcesPlaying++;
+  cancelIdleSubtitle();
   source.onended = () => {
     audioSourcesPlaying = Math.max(0, audioSourcesPlaying - 1);
+    if (audioSourcesPlaying === 0 && turnFinished) scheduleIdleSubtitle(800);
   };
+}
+
+// The backend sends turn_done right after the text, but TTS audio arrives
+// (and plays) afterward — so the subtitle is held until playback ends, or
+// for a reading-time delay when no audio comes (text-only mode).
+let idleSubtitleTimer = null;
+let turnFinished = true;
+
+function cancelIdleSubtitle() {
+  if (idleSubtitleTimer !== null) {
+    clearTimeout(idleSubtitleTimer);
+    idleSubtitleTimer = null;
+  }
+}
+
+function scheduleIdleSubtitle(delayMs) {
+  cancelIdleSubtitle();
+  idleSubtitleTimer = setTimeout(() => {
+    idleSubtitleTimer = null;
+    if (!pendingPermission && audioSourcesPlaying === 0) subtitleEl.textContent = "listening…";
+  }, delayMs);
 }
 
 function outputTick() {
@@ -162,19 +185,26 @@ function stopMock() {
 // WebSocket (see backend/server.py for the wire protocol). Falls back to
 // the mock behavior above whenever it isn't reachable.
 const BACKEND_URL = "ws://127.0.0.1:8765";
+const RECONNECT_MIN_MS = 1000;
+const RECONNECT_MAX_MS = 5000;
 let ws = null;
 let pendingPermission = null; // { requestId, tool }
+let reconnectDelayMs = RECONNECT_MIN_MS;
 
+// The backend takes ~20s to load its models, so the HUD usually starts
+// first — keep retrying instead of staying in mock mode forever.
 function connectBackend() {
-  ws = new WebSocket(BACKEND_URL);
-  ws.binaryType = "arraybuffer"; // raw PCM audio chunks, not Blobs — see handleAudioChunk
+  const socket = new WebSocket(BACKEND_URL);
+  ws = socket;
+  socket.binaryType = "arraybuffer"; // raw PCM audio chunks, not Blobs — see handleAudioChunk
 
-  ws.onopen = () => {
+  socket.onopen = () => {
+    reconnectDelayMs = RECONNECT_MIN_MS;
     stopMock();
     subtitleEl.textContent = "listening…";
   };
 
-  ws.onmessage = (event) => {
+  socket.onmessage = (event) => {
     if (event.data instanceof ArrayBuffer) {
       handleAudioChunk(event.data);
       return;
@@ -183,8 +213,11 @@ function connectBackend() {
     switch (msg.type) {
       case "speaking_start":
         speaking = true;
+        turnFinished = false;
+        cancelIdleSubtitle();
         break;
       case "assistant_text":
+        cancelIdleSubtitle();
         subtitleEl.textContent = msg.text;
         break;
       case "audio_start":
@@ -197,7 +230,10 @@ function connectBackend() {
         speaking = false;
         break;
       case "turn_done":
-        if (!pendingPermission) subtitleEl.textContent = "listening…";
+        turnFinished = true;
+        if (audioSourcesPlaying === 0) {
+          scheduleIdleSubtitle(Math.max(3000, subtitleEl.textContent.length * 60));
+        }
         break;
       case "permission_request":
         pendingPermission = { requestId: msg.request_id, tool: msg.tool };
@@ -219,12 +255,14 @@ function connectBackend() {
     }
   };
 
-  ws.onclose = () => {
-    ws = null;
+  socket.onclose = () => {
+    if (ws === socket) ws = null;
     startMock();
+    setTimeout(connectBackend, reconnectDelayMs);
+    reconnectDelayMs = Math.min(RECONNECT_MAX_MS, reconnectDelayMs * 2);
   };
 
-  ws.onerror = () => {
+  socket.onerror = () => {
     // onclose fires right after — let that handle the fallback.
   };
 }

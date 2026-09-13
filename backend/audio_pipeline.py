@@ -53,6 +53,9 @@ from silero_vad import VADIterator, load_silero_vad  # noqa: E402
 SAMPLE_RATE = 16000
 VAD_CHUNK_SAMPLES = 512  # Silero VAD's required frame size at 16kHz
 MIN_UTTERANCE_SECONDS = 0.3  # discard shorter blips (coughs, clicks)
+# Silero's default (100ms) ends an utterance at every mid-sentence pause,
+# turning one spoken request into several fragmentary agent turns.
+VAD_MIN_SILENCE_MS = 700
 SPEAKER_MATCH_THRESHOLD = 0.75
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), "voice_profile.npy")
 WHISPER_MODEL_SIZE = "small"
@@ -61,7 +64,11 @@ WHISPER_MODEL_SIZE = "small"
 class ActiveListeningPipeline:
     def __init__(self) -> None:
         self._vad_model = load_silero_vad()
-        self._vad_iterator = VADIterator(self._vad_model, sampling_rate=SAMPLE_RATE)
+        self._vad_iterator = VADIterator(
+            self._vad_model,
+            sampling_rate=SAMPLE_RATE,
+            min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+        )
         self._encoder = VoiceEncoder()  # auto-selects CUDA if available, else CPU
         self._profile = self._load_profile()
         self._whisper = self._load_whisper()
@@ -110,7 +117,7 @@ class ActiveListeningPipeline:
             callback=callback,
         )
         self._stream.start()
-        log.info("mic stream started")
+        log.info("mic stream started (%s)", sd.query_devices(kind="input")["name"])
 
     def stop(self) -> None:
         if self._stream is not None:
@@ -130,8 +137,19 @@ class ActiveListeningPipeline:
             np.dot(embedding, self._profile)
             / (np.linalg.norm(embedding) * np.linalg.norm(self._profile))
         )
-        log.debug("speaker similarity: %.3f", similarity)
-        return similarity >= SPEAKER_MATCH_THRESHOLD
+        matched = similarity >= SPEAKER_MATCH_THRESHOLD
+        # INFO, not DEBUG: a silent rejection is otherwise indistinguishable
+        # from "the mic heard nothing" — and similarity drops noticeably when
+        # the capture mic differs from the one used in enroll_voice.py.
+        log.info(
+            "utterance (%.1fs) speaker similarity %.3f %s threshold %.2f — %s",
+            segment.size / SAMPLE_RATE,
+            similarity,
+            ">=" if matched else "<",
+            SPEAKER_MATCH_THRESHOLD,
+            "accepted" if matched else "discarded",
+        )
+        return matched
 
     def _transcribe(self, segment: np.ndarray) -> str:
         segments, _info = self._whisper.transcribe(segment, language="en")
@@ -162,7 +180,6 @@ class ActiveListeningPipeline:
 
                 matched = await loop.run_in_executor(None, self._speaker_matches, segment)
                 if not matched:
-                    log.debug("utterance discarded — speaker mismatch")
                     continue
 
                 text = await loop.run_in_executor(None, self._transcribe, segment)

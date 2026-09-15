@@ -1,4 +1,4 @@
-"""voice-in-the-shell backend — Phase 2.
+"""duck-e-bugger backend — Phase 2.
 
 Hosts a persistent Claude Agent SDK session and bridges it to the Tauri
 shell over a local WebSocket. The shell sends transcripts (later: real STT
@@ -80,7 +80,7 @@ from voice_commands import interpret_yes_no
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("voice-in-the-shell-backend")
+log = logging.getLogger("duck-e-bugger-backend")
 
 HOST = "127.0.0.1"
 PORT = 8765

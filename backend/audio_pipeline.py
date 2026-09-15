@@ -20,7 +20,7 @@ import sysconfig
 import numpy as np
 import sounddevice as sd
 
-log = logging.getLogger("voice-in-the-shell-backend.audio")
+log = logging.getLogger("duck-e-bugger-backend.audio")
 
 
 def _register_nvidia_dll_dirs() -> None:

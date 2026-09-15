@@ -1,4 +1,4 @@
-# voice-in-the-shell
+# Duck-e-bugger
 
 A voice-activated UI layer for LLM agents. It sits on top of an existing LLM/agent capability (action execution with permission, checking back with the user, access-level-scoped tools) and adds:
 
@@ -7,7 +7,9 @@ A voice-activated UI layer for LLM agents. It sits on top of an existing LLM/age
 - **Voice output bar** — animates with the LLM's synthesized voice while it responds, with live subtitles
 - **Pluggable model backend** — connects to a subscription API (e.g. Claude) or a local runtime (e.g. Ollama)
 
-Status: Phases 0-4 done — overlay HUD shell, active listening (VAD + speaker filter + local STT), a Claude Agent SDK backend over WebSocket, voice-driven permission confirmation, and real text-to-speech (local Piper voice) are all working. The output bar is now driven by an `AnalyserNode` on the actual synthesized audio, not mocked amplitude — falls back to text-only (no audio, bar stays a synthetic pulse) if no voice model is installed. See the project plan in the Obsidian vault (`20 Software/Voice in the Shell/`) for architecture notes, decisions, and current pickup point.
+> The name nods to [rubber duck debugging](https://en.wikipedia.org/wiki/Rubber_duck_debugging) — talking through your code out loud until the bug shows itself. Unlike the desk toy, this duck talks back: it's a full voice-driven agent that listens, executes permissioned actions, and responds — not just a silent sounding board.
+
+Status: Phases 0-4 done — overlay HUD shell, active listening (VAD + speaker filter + local STT), a Claude Agent SDK backend over WebSocket, voice-driven permission confirmation, and real text-to-speech (local Piper voice) are all working. The output bar is now driven by an `AnalyserNode` on the actual synthesized audio, not mocked amplitude — falls back to text-only (no audio, bar stays a synthetic pulse) if no voice model is installed. See the project plan in the Obsidian vault (`20 Software/Duck-e-bugger/`) for architecture notes, decisions, and current pickup point.
 
 ## Stack
 

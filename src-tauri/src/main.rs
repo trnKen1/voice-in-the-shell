@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    voice_in_the_shell_lib::run()
+    duck_e_bugger_lib::run()
 }

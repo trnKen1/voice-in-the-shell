@@ -12,7 +12,7 @@ permission flow) keeps working without spoken audio.
 import logging
 import os
 
-log = logging.getLogger("voice-in-the-shell-backend.tts")
+log = logging.getLogger("duck-e-bugger-backend.tts")
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 DEFAULT_VOICE = "en_US-lessac-medium"
